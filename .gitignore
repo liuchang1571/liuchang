@@ -1,0 +1,31 @@
+# ===== 编译产物（不要进仓库）=====
+build/
+cmake-build-*/
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+*.su
+*.d
+*.a
+*.lst
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp
+*~
+.cache/
+compile_commands.json
+
+# ===== 操作系统 =====
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ===== 备份文件 =====
+*.bak
+*.orig
+*_ioc.bak
