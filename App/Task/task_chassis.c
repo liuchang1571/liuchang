@@ -198,6 +198,11 @@ void Task_Chassis_Loop(void)
             /* 关控时 base_rpm 和 rack_mm 保持 0：
              *   后轮目标速度 0（车停）
              *   转向下面第 ④ 步有特殊处理，齿条保持原位不回中 */
+            else {
+                  motor_l->give_current = 0;
+                  motor_r->give_current = 0;
+                  steer->give_out=0;
+            }
         }
 
         /* ============================================================
@@ -235,12 +240,7 @@ void Task_Chassis_Loop(void)
         /* ---- 前轮转向位置环（1 个）---- */
         Steer_Pos_PID_Calc(dt);
 
-        /* ---- 台架测试：绕过 PID，直接给固定电流 ---- */
-        if (BENCH_TEST == 1)
-        {
-            motor_l->give_current = 1000;
-            motor_r->give_current = 1000;
-        }
+
 
         /* ============================================================
          *  ⑥ 发 CAN2
