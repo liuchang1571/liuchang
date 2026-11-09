@@ -21,6 +21,24 @@
 static Steer_t s_steer;
 
 /* ============================================================================
+ *  标定用的三个变量（实测后填，给以后的软件限位当边界）
+ *  定义在这里、声明在 drv_steer.h，所以全工程和调试器都能看到。
+ *  详细用法见 drv_steer.h 里的说明。
+ *
+ *  ★ __attribute__((used)) 是必须加的，不是装饰：
+ *    本工程开了 -fdata-sections + --gc-sections（见 CMakeLists / 链接选项），
+ *    链接器会把"没有任何代码引用"的变量当垃圾删掉。
+ *    这三个变量就是典型的"只给调试器用、没有代码引用"的变量，
+ *    不加 used 的话它们在 ELF 里根本不存在，你在调试器里也就找不到。
+ * ==========================================================================*/
+volatile int16_t g_steer_raw_center __attribute__((used)) = 6552;   /* 正中间（实测） */
+volatile int16_t g_steer_raw_left   __attribute__((used)) = 7742;   /* 最左端，左转（实测） */
+volatile int16_t g_steer_raw_right  __attribute__((used)) = 5358;   /* 最右端，右转（实测） */
+
+/* 当前编码值镜像：只为了调试时能一眼看到读数，不参与任何控制 */
+volatile int16_t g_steer_raw_now __attribute__((used)) = 0;
+
+/* ============================================================================
  *  wrap_enc —— 把任意整数折回 0 ~ 8191
  * ----------------------------------------------------------------------------
  *  什么时候用：算"目标编码器值"的时候。
@@ -73,6 +91,144 @@ static float norm_cnt(int32_t d)
 }
 
 /* ============================================================================
+ *  steer_limit_init —— 把实测的三个编码值变成限位区间（上电跑一次）
+ * ----------------------------------------------------------------------------
+ *  调用者：Steer_Init()
+ *
+ *  实测值就写在文件开头那三个全局变量里：
+ *        中间 6552 / 最左（左转）7742 / 最右（右转）5358
+ *
+ *  做两件事：
+ *    1. 把两端折算成"相对中位的计数"，得到区间 [lo, hi]
+ *    2. 检查这几个值是不是自相矛盾，矛盾就整体关闭限位
+ *
+ *  ★ 为什么要检查？
+ *    参考点用的是 config.h 里的 STEER_CENTER_RAW（= 6552）。
+ *    如果它和实测中位对不上，限位就会在错误的位置生效 ——
+ *    这时宁可关闭限位、退回 ±22mm，也不要在错的地方限。
+ * ==========================================================================*/
+static void steer_limit_init(void)
+{
+    int32_t dl;
+    int32_t dr;
+    int32_t span;
+    float   dc;
+
+    /* 先全部关掉，检查通过再打开 */
+    s_steer.limit_enabled = 0;
+    s_steer.limit_cfg_bad = 0;
+    s_steer.lim_delta_lo  = 0;
+    s_steer.lim_delta_hi  = 0;
+
+    if (STEER_RAW_LIMIT_ENABLE == 0)
+    {
+        return;
+    }
+
+    /* 三个值都得是有效编码值 */
+    if ((g_steer_raw_center < 0) || (g_steer_raw_left < 0) || (g_steer_raw_right < 0))
+    {
+        return;
+    }
+
+    /* ---- 检查 0：实测中位必须和 config 里的 STEER_CENTER_RAW 一致 ----
+     * 这两者分别是"限位的参考点"和"毫米换算的参考点"，
+     * 不一致的话两套坐标会打架。差 100 计数（约 2mm）以上就判为填错。 */
+    dc = norm_cnt((int32_t)g_steer_raw_center - (int32_t)s_steer.center_raw);
+    if ((dc > 100.0f) || (dc < -100.0f))
+    {
+        s_steer.limit_cfg_bad = 1;
+        return;
+    }
+
+    if (g_steer_raw_left == g_steer_raw_right)
+    {
+        s_steer.limit_cfg_bad = 1;
+        return;
+    }
+
+    /* ---- 两端折算成"相对中位的计数"----
+     * 你的数：left 7742 - 6552 = +1190
+     *         right 5358 - 6552 = -1194 */
+    dl = (int32_t)norm_cnt((int32_t)g_steer_raw_left  - (int32_t)s_steer.center_raw);
+    dr = (int32_t)norm_cnt((int32_t)g_steer_raw_right - (int32_t)s_steer.center_raw);
+
+    /* ---- 检查 1：中位必须夹在两端之间 -> 折算后一正一负 ---- */
+    if (!(((dl < 0) && (dr > 0)) || ((dl > 0) && (dr < 0))))
+    {
+        s_steer.limit_cfg_bad = 1;
+        return;
+    }
+
+    /* ---- 检查 2：行程不能太窄（< 100 计数肯定是填错了）---- */
+    span = dr - dl;
+    if (span < 0)
+    {
+        span = -span;
+    }
+    if (span < 100)
+    {
+        s_steer.limit_cfg_bad = 1;
+        return;
+    }
+
+    /* ---- 通过：记下区间 ---- */
+    s_steer.lim_delta_lo = (int16_t)((dl < dr) ? dl : dr);
+    s_steer.lim_delta_hi = (int16_t)((dl < dr) ? dr : dl);
+    s_steer.limit_enabled = 1;
+}
+
+/* ============================================================================
+ *  steer_clamp_raw —— 把目标编码值钳进实测两端之内
+ * ----------------------------------------------------------------------------
+ *  调用者：Steer_SetTargetMM()
+ *
+ *  用你的数字算一遍（中位 6552，两端 5358 / 7742，内缩 55）：
+ *  折算区间 = [-1194, +1190]，内缩后 = [-1139, +1135]
+ *
+ *      目标 6552（中间）-> 落在区间内，原样放行
+ *      目标 7742（左端）-> +1190 > 1135，钳到 +1135 -> 7687（离极限约 1mm）
+ *      目标 5358（右端）-> -1194 < -1139，钳到 -1139 -> 5413
+ *      目标 2000（离谱值）-> 折算后远超下界，同样钳到 5413
+ * ==========================================================================*/
+static int16_t steer_clamp_raw(int16_t raw)
+{
+    int32_t d;
+    int32_t lo;
+    int32_t hi;
+
+    /* 限位没生效（没填 / 填错 / 被关掉）-> 原样放行，退回旧行为 */
+    if (s_steer.limit_enabled == 0)
+    {
+        return raw;
+    }
+
+    /* 把"内缩 1mm"算进来：下界往上抬，上界往下压 */
+    lo = (int32_t)s_steer.lim_delta_lo + (int32_t)STEER_RAW_MARGIN_CNT;
+    hi = (int32_t)s_steer.lim_delta_hi - (int32_t)STEER_RAW_MARGIN_CNT;
+
+    /* 防呆：万一区间特别窄，内缩后反了，就退化成中点 */
+    if (lo > hi)
+    {
+        lo = ((int32_t)s_steer.lim_delta_lo + (int32_t)s_steer.lim_delta_hi) / 2;
+        hi = lo;
+    }
+
+    d = (int32_t)norm_cnt((int32_t)raw - (int32_t)s_steer.center_raw);
+
+    if (d < lo)
+    {
+        d = lo;
+    }
+    if (d > hi)
+    {
+        d = hi;
+    }
+
+    return wrap_enc((int32_t)s_steer.center_raw + d);
+}
+
+/* ============================================================================
  *  Steer_Get —— 拿到转向电机对象
  *  调用者：task_chassis.c
  * ==========================================================================*/
@@ -101,6 +257,11 @@ void Steer_Init(float kp, float ki, float kd, int16_t center_raw, float raw_per_
      * 真正收到第一帧反馈后会被改成"当前位置"，见 UpdateFeedback */
     s_steer.target_raw = center_raw;
     s_steer.actual_raw = center_raw;
+
+    /* ---- 编码值软件限位：用实测的三端值算出限位区间 ----
+     * ★ 必须在 center_raw 赋值之后调用（它拿 center 当参考点）。
+     * ★ 那三个全局变量在这里被真正读取，所以不会被链接器当垃圾删掉。 */
+    steer_limit_init();
 
     s_steer.last_rx_tick = HAL_GetTick();
 }
@@ -135,12 +296,19 @@ void Steer_UpdateFeedback(uint16_t angle_raw, int16_t rpm,
     /* 保存反馈 */
     s_steer.actual_raw = angle_raw;
 
+    /* 镜像一份给调试器看（标定的时候就是读这个数）
+     * ★ 不参与任何控制，纯粹为了方便观察。 */
+    g_steer_raw_now = (int16_t)angle_raw;
+
     /* 编码器值 -> 毫米
      *   (当前值 - 中位值) / 每毫米计数 = 毫米
      * 注意 raw_per_mm 可能是负数（方向反了），
      * 这里不需要特殊处理，除以负数结果自动是反的，逻辑一致。 */
     mm = (float)(angle_raw - s_steer.center_raw) / s_steer.raw_per_mm;
     s_steer.actual_mm = mm;
+
+    /* 相对中位的计数（编码值限位判断用；norm_cnt 已处理 0/8191 回绕） */
+    s_steer.actual_delta = (int16_t)norm_cnt((int32_t)angle_raw - (int32_t)s_steer.center_raw);
 
     s_steer.actual_rpm = rpm;
     s_steer.torque_cur = torque;
@@ -186,6 +354,22 @@ void Steer_SetTargetMM(float mm)
      * 最后用 wrap_enc 折回 0~8191（因为可能超过一圈） */
     cnt = (int32_t)(mm * s_steer.raw_per_mm);
     s_steer.target_raw = wrap_enc(cnt + s_steer.center_raw);
+
+    /* ------------------------------------------------------------------
+     * 【第二道防线：编码值限位】
+     * ------------------------------------------------------------------
+     * 上面那道是按"毫米"钳的，依赖 STEER_RAW_PER_MM 标定得准。
+     * 这一道直接按实测编码值钳，不怕标定误差：
+     * 不管前面算出什么目标，都压到实测的两端之内。 */
+    s_steer.target_raw = steer_clamp_raw(s_steer.target_raw);
+
+    /* 限位可能把目标拉回来了，这里按最终目标反算一次毫米，
+     * 让调试器里 target_mm 和 target_raw 对得上。 */
+    if (s_steer.raw_per_mm != 0.0f)
+    {
+        s_steer.target_mm = norm_cnt((int32_t)s_steer.target_raw - (int32_t)s_steer.center_raw)
+                            / s_steer.raw_per_mm;
+    }
 }
 
 /* ============================================================================
@@ -214,19 +398,42 @@ void Steer_Pos_PID_Calc(float dt)
     }
 
     /* ------------------------------------------------------------------
-     * 【第二道防线：实测超出限位 -> 立刻切断输出】
+     * 【第三道防线：实测位置已经超出限位 -> 立刻切断输出】
      * ------------------------------------------------------------------
-     * 如果实测位置已经超过 软件限位+2mm，
-     * 说明齿条已经顶到机械块上了，再出力只会把东西顶坏。
-     * 所以直接输出 0 并清积分。
-     * 等外力把齿条推回来，就自动恢复正常。 */
-    if (s_steer.actual_mm > STEER_RACK_MM_MAX + 2.0f ||
-        s_steer.actual_mm < -STEER_RACK_MM_MAX - 2.0f)
+     * 目标虽然钳住了，但齿条可能被外力推出去（撞到东西、有人推车），
+     * 或者编码值跳变。这时继续出力只会把齿轮齿条顶坏。
+     * 所以直接输出 0 并清积分，等位置回到范围内就自动恢复。
+     *
+     * 有编码值限位就用它（主防线），没启用就退回旧的 ±22mm 判断。 */
+    if (s_steer.limit_enabled)
     {
-        s_steer.integral = 0.0f;
-        s_steer.give_out = 0;
-        s_steer.limit_hit = 1;      /* 打上标记，方便调试时看出来 */
-        return;
+        int32_t d;
+
+        d = (int32_t)s_steer.actual_delta;
+
+        if ((d > (int32_t)s_steer.lim_delta_hi + (int32_t)STEER_RAW_GUARD_CNT) ||
+            (d < (int32_t)s_steer.lim_delta_lo - (int32_t)STEER_RAW_GUARD_CNT))
+        {
+            s_steer.integral = 0.0f;
+            s_steer.give_out = 0;
+            s_steer.limit_hit = 1;      /* 打上标记，方便调试时看出来 */
+            s_steer.raw_limit_hit = 1;
+            return;
+        }
+        s_steer.raw_limit_hit = 0;
+    }
+    else
+    {
+        /* 旧行为：按毫米判断（STEER_RAW_PER_MM 不准时可能误判，
+         * 所以只在编码值限位没启用时用它） */
+        if (s_steer.actual_mm > STEER_RACK_MM_MAX + 2.0f ||
+            s_steer.actual_mm < -STEER_RACK_MM_MAX - 2.0f)
+        {
+            s_steer.integral = 0.0f;
+            s_steer.give_out = 0;
+            s_steer.limit_hit = 1;
+            return;
+        }
     }
     s_steer.limit_hit = 0;
 

@@ -24,7 +24,7 @@
   ******************************************************************************
   */
 #include "task_chassis.h"
-#include "config.h"        /* 参数、rc_data、rc_lost_flag、BENCH_TEST */
+#include "config.h"        /* 参数、rc_data、rc_lost_flag */
 #include "drv_dbus.h"      /* DBUS_GetChannel */
 #include "drv_motor.h"     /* 后轮速度环 */
 #include "drv_steer.h"     /* 前轮转向位置环 */
@@ -127,6 +127,10 @@ void Task_Chassis_Loop(void)
     /* ==================== 死循环开始，每 1ms 转一圈 ==================== */
     for (;;)
     {
+        /* ---- 心跳：证明这个 1kHz 循环真的在跑（只给调试用，不参与控制）----
+         * 恒为 0 就说明任务压根没跑起来，问题在初始化而不是 CAN。 */
+        g_alive_cnt = g_alive_cnt + 1U;
+
         /* ============================================================
          *  ① 处理遥控器
          * ------------------------------------------------------------
@@ -168,41 +172,23 @@ void Task_Chassis_Loop(void)
         base_rpm = 0.0f;
         rack_mm = 0.0f;
 
-        if (BENCH_TEST == 1)
+        /* 只有遥控器没关控时才听摇杆。
+         * 关控时 base_rpm / rack_mm 保持 0：
+         *   后轮目标速度 0（速度环会把车刹停）
+         *   转向目标不更新（见第 ④ 步），齿条保持原位不回中 */
+        if (rc_lost_flag == 0)
         {
-            /* ----------------------------------------------------
-             * 台架测试模式（config.h 里 BENCH_TEST 改成 1 才走这里）
-             * 完全不看遥控器，方便验证接线和方向。
-             * 测完一定要改回 0。
-             * -------------------------------------------------- */
-            base_rpm = 0.0f;       /* 后轮交给下面的固定电流 */
-            rack_mm = 10.0f;       /* 齿条推到 +10mm（往左一点） */
-        }
-        else
-        {
-            /* ----------------------------------------------------
-             * 正常模式：只有遥控器没关控时才听摇杆
-             * -------------------------------------------------- */
-            if (rc_lost_flag == 0)
-            {
-                /* ch3 = 左摇杆上下 -> 前进速度（转子 rpm） */
-                base_rpm = RC_Norm(DBUS_GetChannel(&rc_data, 3));
-                base_rpm = RC_DeadZone(base_rpm, RC_DEAD_ZONE);
-                base_rpm = base_rpm * CHASSIS_MAX_RPM;
+            /* ch3 = 左摇杆上下 -> 前进速度（转子 rpm） */
+            base_rpm = RC_Norm(DBUS_GetChannel(&rc_data, 3));
+            base_rpm = RC_DeadZone(base_rpm, RC_DEAD_ZONE);
+            base_rpm = base_rpm * CHASSIS_MAX_RPM;
 
-                /* ch2 = 左摇杆左右 -> 齿条位置（毫米，正=向左） */
-                rack_mm = RC_Norm(DBUS_GetChannel(&rc_data, 2));
-                rack_mm = RC_DeadZone(rack_mm, RC_DEAD_ZONE);
-                rack_mm = rack_mm * STEER_RACK_MM_MAX;
-            }
-            /* 关控时 base_rpm 和 rack_mm 保持 0：
-             *   后轮目标速度 0（车停）
-             *   转向下面第 ④ 步有特殊处理，齿条保持原位不回中 */
-            else {
-                  motor_l->give_current = 0;
-                  motor_r->give_current = 0;
-                  steer->give_out=0;
-            }
+            /* ch2 = 左摇杆左右 -> 齿条位置（毫米，正 = 向左）
+             * ★ 最后乘 STEER_DIR：用来适配"摇杆方向和齿条方向相反"。
+             *   翻方向只能翻这里，不能翻 STEER_RAW_PER_MM（原因见 config.h）。 */
+            rack_mm = RC_Norm(DBUS_GetChannel(&rc_data, 2));
+            rack_mm = RC_DeadZone(rack_mm, RC_DEAD_ZONE);
+            rack_mm = rack_mm * STEER_RACK_MM_MAX * STEER_DIR;
         }
 
         /* ============================================================
@@ -224,7 +210,7 @@ void Task_Chassis_Loop(void)
 
         /* ---- 前轮：目标是齿条位置（毫米）----
          * ★ 关控时【故意不更新】转向目标，齿条保持原位不回正。 */
-        if (rc_lost_flag == 0 || BENCH_TEST == 1)
+        if (rc_lost_flag == 0)
         {
             Steer_SetTargetMM(out.rack_mm);
         }

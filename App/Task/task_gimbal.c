@@ -108,12 +108,22 @@ void Task_Gimbal_Loop(void)
         cur4[3] = g_shooter.fric_r_cur;
         CAN_Send4(&hcan1, 0x200, cur4);
 
-        /* 0x1FF：yaw 6020 电压（槽0） */
+#if (STEER_ON_CAN1 == 0)
+        /* 0x1FF：yaw 6020 电压（槽0）
+         *
+         * ★ 只在【转向电机不在 CAN1 上】时才发这一帧。
+         *   因为一帧 0x1FF 会覆盖全部 4 个槽：如果转向电机也接在 CAN1，
+         *   这一帧里的 0 会把它的控制量反复清零，电机就变成"时有时无"。
+         *   转向接在 CAN1 时，这帧由底盘任务发（BSP_CAN_Send_Steer_Voltage），
+         *   全总线只有一个 0x1FF 发送者。 */
         volt4[0] = g_gimbal.yaw_volt;
         volt4[1] = 0;
         volt4[2] = 0;
         volt4[3] = 0;
         CAN_Send4(&hcan1, 0x1FF, volt4);
+#else
+        (void)volt4;    /* 这帧不发了，只占位，避免"未使用变量"警告 */
+#endif
 
         /* ============================================================
          *  ④ 严格等 1ms
