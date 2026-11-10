@@ -48,6 +48,12 @@ void Power_UpdateFeedback(int16_t power_0p1w, int16_t buffer_0p1j)
     g_power.buffer_j     = (float)buffer_0p1j * 0.1f;
     g_power.last_rx_tick = HAL_GetTick();
     g_power.online       = 1U;
+
+    /* 记录见过的最大缓冲能量（判断数据可不可信用） */
+    if (g_power.buffer_j > g_power.buffer_max_j)
+    {
+        g_power.buffer_max_j = g_power.buffer_j;
+    }
 }
 
 /* ============================================================================
@@ -168,9 +174,18 @@ float Power_CalcScale(const int16_t i_raw[], const int16_t rpm[], uint8_t cnt)
     /* ---- 第 5 步：缓冲能量保护（可选） ----
      * 规则里缓冲能量低于 0J 会断电 5 秒，所以提前降额留余量。
      *
-     * 注意：只有收到过 0x31 才生效。没接功率模块时 buffer_j 是 0，
-     *       如果照做会把功率直接压到 0，车根本动不了。 */
-    if (g_power.online)
+     * ★ 生效条件（两个都满足才行）：
+     *   1. 收到过 0x31（online），且没超时
+     *   2. 开机以来见过的最大缓冲能量 > POWER_BUFFER_MIN_J
+     *
+     *   为什么条件 2 这么重要？
+     *     真正的裁判系统开局缓冲能量是满的 60J，所以 buffer_max_j 一定
+     *     会远超阈值，保护正常工作。
+     *     但如果功率模块【没接裁判系统】或者数据是假的，它可能一直报 0J，
+     *     这时若照做就会把功率永久压到 0 —— 表现是
+     *     "后轮完全不动，但转向正常"（转向不经过功率限制），非常难查。
+     *     加上条件 2 就不会再被这种假数据坑住。 */
+    if ((g_power.online != 0U) && (g_power.buffer_max_j > POWER_BUFFER_MIN_J))
     {
         if (g_power.buffer_j <= POWER_BUFFER_MIN_J)
         {

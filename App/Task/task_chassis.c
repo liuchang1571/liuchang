@@ -85,8 +85,9 @@ static float RC_DeadZone(float v, float dz)
 void Task_Chassis_Init(void)
 {
     /* ---- 后轮：速度环（2 个电机）----
-     * 编号 = 电调 ID 减 1。
-     * DRIVE_ID_L 是 1，就初始化 0 号电机（对应 0x201 的反馈）。 */
+     * 编号 = 电调 ID 减 1（因为 0x200+ID 的反馈索引是 ID-1）。
+     *   左后轮 ID2 -> 1 号电机（反馈 0x202）
+     *   右后轮 ID1 -> 0 号电机（反馈 0x201） */
     Motor_Init(DRIVE_ID_L - 1, DRIVE_PID_KP, DRIVE_PID_KI, DRIVE_PID_KD);
     Motor_Init(DRIVE_ID_R - 1, DRIVE_PID_KP, DRIVE_PID_KI, DRIVE_PID_KD);
 
