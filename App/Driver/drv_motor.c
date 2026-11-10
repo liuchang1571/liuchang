@@ -164,6 +164,18 @@ void Motor_Speed_PID_Calc(Motor_t *m, float dt)
         return;                            /* 空指针，直接返回 */
     }
 
+    /* ---- 掉线保护：超过 50ms 没收到反馈 -> 不许出力 ----
+     * online 由 Motor_CheckOnline() 每 10ms 更新。
+     * 不检查的话：反馈线一松，速度环会拿着【陈旧的 actual_rpm】
+     * 继续算误差，可能一直顶满电流去追一个假目标。 */
+    if (m->online == 0)
+    {
+        m->give_current = 0;
+        m->integral     = 0.0f;
+        m->last_error   = 0.0f;
+        return;
+    }
+
     /* dt 防呆：万一传进来 0 或者特别大的数（说明任务调度出问题了），
      * 就强制用 1ms，避免算出天文数字。 */
     if (dt <= 0.0f || dt > 0.1f)

@@ -32,6 +32,7 @@
 #include "bsp_can.h"       /* 发 CAN2 */
 #include "task_rc.h"       /* Task_RC_Loop */
 #include "ackermann.h"     /* 运动解算 */
+#include "drv_power.h"     /* 功率限制：Power_Init / Power_CalcScale */
 
 /* FreeRTOS 的头文件。注意顺序：FreeRTOS.h 必须在 task.h 前面。 */
 #include "FreeRTOS.h"
@@ -96,6 +97,10 @@ void Task_Chassis_Init(void)
      * ★ 这两个必须你自己标定，详见 config.h 的说明。 */
     Steer_Init(STEER_PID_KP, STEER_PID_KI, STEER_PID_KD,
                STEER_CENTER_RAW, STEER_RAW_PER_MM);
+
+    /* ---- 功率限制：初始化 ----
+     * 参数全在 config.h 第 5.5 部分，这里只是把状态清零。 */
+    Power_Init();
 }
 
 /* ============================================================================
@@ -222,6 +227,50 @@ void Task_Chassis_Loop(void)
         /* ---- 后轮速度环（2 个）---- */
         Motor_Speed_PID_Calc(motor_l, dt);
         Motor_Speed_PID_Calc(motor_r, dt);
+
+        /* ============================================================
+         *  ⑤.5 功率限制（裁判系统规则）
+         * ------------------------------------------------------------
+         *  规则：底盘功率超限会扣"缓冲能量"，扣到 0 以下直接断电 5 秒。
+         *
+         *  做法：把两路 PID 电流当成 I，用功率模型
+         *          F(k) = A·k² + B·k + L
+         *        解出满足 F(k) ≤ P 的最大 k，再把电流乘上 k。
+         *
+         *  ★ 必须在 PID 之后、发 CAN 之前做。
+         *  ★ 公式和参数见 config.h 第 5.5 部分 / drv_power.h。 */
+        {
+            int16_t i_buf[2];       /* 两路电流 */
+            int16_t n_buf[2];       /* 两路转速 */
+            float   k;              /* 缩放系数 0~1 */
+
+            i_buf[0] = motor_l->give_current;
+            i_buf[1] = motor_r->give_current;
+            n_buf[0] = (int16_t)motor_l->actual_rpm;
+            n_buf[1] = (int16_t)motor_r->actual_rpm;
+
+            k = Power_CalcScale(i_buf, n_buf, 2U);
+
+            if (k < 0.999f)
+            {
+                /* 两路按同一个 k 缩放（"统一缩放系数"的含义） */
+                motor_l->give_current = (int16_t)((float)motor_l->give_current * k);
+                motor_r->give_current = (int16_t)((float)motor_r->give_current * k);
+
+                /* 抗积分饱和：限功率期间把积分往回压。
+                 * 不压的话，限功率时误差一直消不掉，积分会攒满，
+                 * 一旦功率放开就会猛冲一下。
+                 * （ki = 0 时积分本来就不起作用，这里是为以后留的。） */
+                if (motor_l->ki > 0.0001f)
+                {
+                    motor_l->integral = motor_l->integral * k;
+                }
+                if (motor_r->ki > 0.0001f)
+                {
+                    motor_r->integral = motor_r->integral * k;
+                }
+            }
+        }
 
         /* ---- 前轮转向位置环（1 个）---- */
         Steer_Pos_PID_Calc(dt);

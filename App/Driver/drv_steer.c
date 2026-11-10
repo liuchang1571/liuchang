@@ -391,6 +391,18 @@ void Steer_Pos_PID_Calc(float dt)
         return;
     }
 
+    /* ---- 第 0.5 步：掉线保护 ----
+     * have_fb 只表示"历史上收到过"，反馈线中途断了它还是 1。
+     * 这时 actual_raw 是【陈旧值】，位置环会照着一个几百毫秒前的角度
+     * 继续出力 —— 齿条可能一直顶在限位上。
+     * 所以超过 50ms 没反馈（Steer_CheckOnline 会置 online=0）就直接撒手。 */
+    if (s_steer.online == 0)
+    {
+        s_steer.integral = 0.0f;
+        s_steer.give_out = 0;
+        return;
+    }
+
     /* dt 防呆：防止传进来 0，或者任务卡了很久才跑一次 */
     if (dt <= 0.0f || dt > 0.1f)
     {

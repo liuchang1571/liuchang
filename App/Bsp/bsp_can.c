@@ -22,6 +22,7 @@
 #include "bsp_motor_dji3508.h"
 #include "bsp_motor_gm6020.h"
 #include "config_shooter.h"
+#include "drv_power.h"     /* Power_UpdateFeedback()：功率模块 0x31 */
 
 /* 编译期检查：电调 ID 必须在 1~4（下面用 "ID 减 1" 当数组下标） */
 #if (DRIVE_ID_L < 1) || (DRIVE_ID_L > 4) || (DRIVE_ID_R < 1) || (DRIVE_ID_R > 4)
@@ -325,6 +326,21 @@ void BSP_CAN_Init(void)
         Error_Handler();
     }
 
+    /* ---- CAN2 再加一组：功率模块 0x31 ----
+     * ★ 0x31 不在 0x200~0x20F 那一段里，上面那组过滤器会把它直接挡掉，
+     *   表现就是"功率模块明明接着，g_power.power_w 一直是 0"。
+     *   所以必须单独开一组精确匹配（掩码 0x7FF = 11 位全匹配）。
+     *   CAN2 可用 14~27 号过滤器，这里用 15 号。 */
+    f.FilterBank       = 15;
+    f.FilterIdHigh     = (0x031U << 5);
+    f.FilterIdLow      = 0;
+    f.FilterMaskIdHigh = (0x7FFU << 5);
+    f.FilterMaskIdLow  = 0x0006;
+    if (HAL_CAN_ConfigFilter(&hcan2, &f) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
     /* ---- 启动：不调这个，CAN 一直停在初始化模式，收发全无 ---- */
     g_init_step = 3;
     if (HAL_CAN_Start(&hcan1) != HAL_OK)
@@ -375,6 +391,8 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
     uint16_t angle;
     int16_t  rpm;
     int16_t  torque;
+    int16_t  power_0p1w;    /* 0x31：底盘功率（0.1W） */
+    int16_t  buffer_0p1j;   /* 0x31：缓冲能量（0.1J） */
     uint8_t  temp;
 
     /* 一次中断里可能堆了好几帧，读到 FIFO 空为止 */
@@ -385,8 +403,11 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
             return;
         }
 
-        /* 只用标准帧、8 字节数据帧 */
-        if (rx.IDE != CAN_ID_STD || rx.DLC != 8)
+        /* 只用标准帧。
+         * ★ 这里【不能】强制要求 DLC == 8：功率模块的 0x31 只有 4 字节，
+         *   写死 8 会把功率帧直接扔掉（表现就是功率一直是 0）。
+         *   8 字节的检查放到下面电调分支里做。 */
+        if (rx.IDE != CAN_ID_STD)
         {
             continue;
         }
@@ -411,6 +432,24 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
             {
                 g_can2_rx_cnt[id - 0x200U] = (uint16_t)(g_can2_rx_cnt[id - 0x200U] + 1U);
             }
+        }
+
+        /* ---- 功率模块 0x31：4 字节，单独处理 ---- 
+         * 协议：第1~2字节 = 底盘功率（0.1W），第3~4字节 = 缓冲能量（0.1J）
+         * 处理完直接 continue，不走下面电调的解析。 */
+        if ((id == 0x031U) && (rx.DLC >= 4U))
+        {
+            power_0p1w  = (int16_t)(((uint16_t)data[0] << 8) | (uint16_t)data[1]);
+            buffer_0p1j = (int16_t)(((uint16_t)data[2] << 8) | (uint16_t)data[3]);
+
+            Power_UpdateFeedback(power_0p1w, buffer_0p1j);
+            continue;
+        }
+
+        /* ---- 其余都是电调反馈，固定 8 字节 ---- */
+        if (rx.DLC != 8U)
+        {
+            continue;
         }
 
         /* 按协议拼数值，同样是高字节在前 */
