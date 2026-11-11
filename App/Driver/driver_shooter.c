@@ -16,13 +16,45 @@
 
 Shooter_t g_shooter;
 
+/* ============================================================================
+ *  ★ FreeMASTER 在线可调参数（改完立刻生效，不用重新编译）
+ * ============================================================================
+ *  FreeMASTER 靠 ELF 符号表找地址，所以这些必须是【非常量的 RAM 全局变量】。
+ *  上电默认值取自 config_shooter.h 的同名宏。
+ *
+ *  变量名                     含义                          默认
+ *  ---------------------------------------------------------------------------
+ *  feeder_pos_kp             位置环 P（计数 -> 转子rpm）    FEEDER_POS_KP
+ *  feeder_pos_deadband       到位死区（计数）               FEEDER_POS_DEADBAND
+ *  feeder_spd_limit_rpm      位置环输出限幅（rpm）          FEEDER_SPD_LIMIT_RPM
+ *
+ *  feeder_spd_kp             速度环 P（rpm -> 电流）        FEEDER_SPD_KP
+ *  feeder_spd_ki             速度环 I                     FEEDER_SPD_KI
+ *  feeder_spd_filter_alpha   速度反馈一阶低通 α            FEEDER_SPD_FILTER_ALPHA
+ *
+ *  feeder_cur_slew           电流变化率（每 1ms）           FEEDER_CUR_SLEW
+ *  feeder_counts_per_slot    一格多少计数（标定用）         FEEDER_COUNTS_PER_SLOT
+ * ==========================================================================*/
+volatile float feeder_pos_kp           = FEEDER_POS_KP;
+volatile float feeder_pos_deadband     = FEEDER_POS_DEADBAND;
+volatile float feeder_spd_limit_rpm    = FEEDER_SPD_LIMIT_RPM;
+volatile float feeder_spd_kp           = FEEDER_SPD_KP;
+volatile float feeder_spd_ki           = FEEDER_SPD_KI;
+volatile float feeder_spd_filter_alpha = FEEDER_SPD_FILTER_ALPHA;
+volatile float feeder_cur_slew         = (float)FEEDER_CUR_SLEW;
+volatile float feeder_counts_per_slot  = FEEDER_COUNTS_PER_SLOT;
+
 /* ------------------------------------------------------------------ 内部 */
 /* 往前走一格 */
 static void Feeder_AddStep(int8_t n)
 {
-    g_shooter.feeder_target_cnt += (float)n * FEEDER_COUNTS_PER_SLOT;
+    g_shooter.feeder_target_cnt += (float)n * feeder_counts_per_slot;
     g_shooter.feeder_step_tick   = HAL_GetTick();
-    g_shooter.feeder_block_tick  = 0;
+
+    /* ★ 千万不能在这里清 feeder_block_tick！
+       连发间隔 333ms < 卡弹判定窗口 400ms，每加一格都清零的话，
+       计时器永远走不到 400ms -> 连发模式下卡弹检测彻底失效（jam_cnt 恒为 0）。
+       卡弹计时器只在"判定成功、回退一格"时清（见 3.6）。 */
 }
 
 /* 清拨弹盘的两个环（模式切换 / 失能时用） */
@@ -156,6 +188,13 @@ void Shooter_Update(uint8_t s1, uint8_t s2)
 
     /* ==================== 3. 拨弹盘 ==================== */
 
+    /* 3.0 把 FreeMASTER 里的参数搬进 PID 结构（每 1ms 一次，改了立刻生效）
+       ★ 只能改 feeder_xxx 这些顶层变量；直接改 PID 结构里的 kp 会在下一拍被覆盖 */
+    g_shooter.feeder_pos_pid.kp      = feeder_pos_kp;
+    g_shooter.feeder_pos_pid.max_out = feeder_spd_limit_rpm;
+    g_shooter.feeder_spd_pid.kp      = feeder_spd_kp;
+    g_shooter.feeder_spd_pid.ki      = feeder_spd_ki;
+
     /* 3.1 模式关：不出力，目标跟住实际 */
     if (mode == 0)
     {
@@ -205,7 +244,15 @@ void Shooter_Update(uint8_t s1, uint8_t s2)
 
             if ((uint32_t)(now - g_shooter.feeder_step_tick) >= FEEDER_AUTO_INTERVAL_MS)
             {
-                Feeder_AddStep(1);
+                /* ★ 上一格还没走完（含卡弹回退中）就先不叠加，
+                   否则机构一卡住目标会无限堆积，一松脱就疯狂补跑、连甩好几发。 */
+                float err_now = g_shooter.feeder_target_cnt
+                              - (float)g_shooter.feeder.angle_total;
+
+                if (fabsf(err_now) < fabsf(feeder_counts_per_slot) * 0.5f)
+                {
+                    Feeder_AddStep(1);
+                }
             }
         }
         else
@@ -222,7 +269,7 @@ void Shooter_Update(uint8_t s1, uint8_t s2)
 
     if ((uint32_t)(now - g_shooter.mode_tick) > FEEDER_BLOCK_START_MS)
     {
-        if ((fabsf(g_shooter.feeder_err) > FEEDER_POS_DEADBAND) &&
+        if ((fabsf(g_shooter.feeder_err) > feeder_pos_deadband) &&
             (fabsf((float)g_shooter.feeder.speed_rpm) < FEEDER_STALL_RPM))
         {
             if (g_shooter.feeder_block_tick == 0)
@@ -238,7 +285,7 @@ void Shooter_Update(uint8_t s1, uint8_t s2)
                    ★ 如果只写 target -= 1格，在"一格都没走进去"的卡弹情况下
                      误差刚好被抹平，机构一动都不动，卡弹根本解不开。 */
                 g_shooter.feeder_target_cnt -= g_shooter.feeder_err
-                                             + (float)FEEDER_BACK_SLOTS * FEEDER_COUNTS_PER_SLOT;
+                                             + (float)FEEDER_BACK_SLOTS * feeder_counts_per_slot;
 
                 g_shooter.feeder_block_tick  = 0;
                 g_shooter.feeder_step_tick   = now;
@@ -271,7 +318,7 @@ void Shooter_Update(uint8_t s1, uint8_t s2)
     }
 
     /* 走完一格 -> 重试计数清零 */
-    if (fabsf(g_shooter.feeder_err) < FEEDER_POS_DEADBAND)
+    if (fabsf(g_shooter.feeder_err) < feeder_pos_deadband)
     {
         g_shooter.feeder_retry_cnt = 0;
     }
@@ -282,35 +329,33 @@ void Shooter_Update(uint8_t s1, uint8_t s2)
         float out;
 
         /* 速度反馈一阶低通（3508 低速时 rpm 量化噪声大） */
-        g_shooter.feeder_spd_filt += FEEDER_SPD_FILTER_ALPHA *
+        g_shooter.feeder_spd_filt += feeder_spd_filter_alpha *
             ((float)g_shooter.feeder.speed_rpm - g_shooter.feeder_spd_filt);
 
         spd_cmd = PID_Calculate(&g_shooter.feeder_pos_pid,
                                 g_shooter.feeder_target_cnt,
                                 (float)g_shooter.feeder.angle_total);
 
-        /* 低速区规避：到位就停；误差大但速度太小就抬到最小速度，
-           跳过 3508 "嗡嗡抖但几乎不转" 的 1~5 rpm 区间 */
-        if (fabsf(g_shooter.feeder_err) < FEEDER_POS_DEADBAND)
+        /* 到位死区：误差小于它 -> 速度指令给 0，电机彻底安静
+           ★ 这里【不再】做"最小速度"补偿。那是开关式补丁，会在到位的时候
+             来回蹭（60rpm 冲过死区 -> 误差变负 -> 反向再给 60rpm）。
+             推力交给 FEEDER_SPD_KP 就够了。 */
+        if (fabsf(g_shooter.feeder_err) < feeder_pos_deadband)
         {
             spd_cmd = 0.0f;
-        }
-        else if (fabsf(spd_cmd) < FEEDER_MIN_RPM)
-        {
-            spd_cmd = (g_shooter.feeder_err > 0.0f) ? FEEDER_MIN_RPM : -FEEDER_MIN_RPM;
         }
 
         out = PID_Calculate(&g_shooter.feeder_spd_pid, spd_cmd,
                             g_shooter.feeder_spd_filt);
 
         /* 电流变化率限制：减小"哒哒"的冲击声和机械震动 */
-        if (out > (float)g_shooter.feeder_cur_last + (float)FEEDER_CUR_SLEW)
+        if (out > (float)g_shooter.feeder_cur_last + feeder_cur_slew)
         {
-            out = (float)g_shooter.feeder_cur_last + (float)FEEDER_CUR_SLEW;
+            out = (float)g_shooter.feeder_cur_last + feeder_cur_slew;
         }
-        if (out < (float)g_shooter.feeder_cur_last - (float)FEEDER_CUR_SLEW)
+        if (out < (float)g_shooter.feeder_cur_last - feeder_cur_slew)
         {
-            out = (float)g_shooter.feeder_cur_last - (float)FEEDER_CUR_SLEW;
+            out = (float)g_shooter.feeder_cur_last - feeder_cur_slew;
         }
 
         if (out >  FEEDER_CUR_MAX) out =  FEEDER_CUR_MAX;

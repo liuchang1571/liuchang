@@ -190,13 +190,6 @@ void CAN_Send4(CAN_HandleTypeDef *hcan, uint16_t std_id, const int16_t val[4])
     {
         can1_diag_snapshot();
 
-#if (CAN1_TX_DISABLE == 1) && (CAN1_LOOPBACK_TEST == 0)
-        /* ★ 调试模式：CAN1 只收不发。
-         *   目的是让接收不受"发送没人应答 -> bus-off -> 连收也停"的影响。
-         *   详见 config.h 里 CAN1_TX_DISABLE 的说明。
-         *   回环自测时这个屏蔽必须让开（回环要靠自己发帧）。 */
-        return;
-#endif
     }
 
     /* ---- 第 1 步：4 个 int16 拆成 8 个字节，高字节在前 ---- */
@@ -283,17 +276,6 @@ void BSP_CAN_Init(void)
 {
     CAN_FilterTypeDef f = {0};
 
-#if (CAN1_LOOPBACK_TEST == 1)
-    /* ★ 自测：把 CAN1 改成回环模式。
-     *   回环下自己发的帧会被自己收到，不需要总线上有其它节点应答。
-     *   用途和原理见 config.h 里 CAN1_LOOPBACK_TEST 的说明。
-     *   ★ 必须在配过滤器之前重新 HAL_CAN_Init，让模式生效。 */
-    hcan1.Init.Mode = CAN_MODE_LOOPBACK;
-    if (HAL_CAN_Init(&hcan1) != HAL_OK)
-    {
-        Error_Handler();
-    }
-#endif
 
     /* ---- 过滤器：只放行 0x200~0x20F（所有电机的反馈都在这一段） ----
      * 掩码 0x7F0 的含义：高 7 位必须等于 0x200 的高 7 位，低 4 位随便。

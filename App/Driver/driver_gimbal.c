@@ -198,6 +198,9 @@ void Gimbal_Control(void)
         g_gimbal.pitch_target     = Gimbal_ClampPitch(PITCH_BOOT_JOINT_DEG);
     }
 
+    /* 实测关节角：不管开关开没开都更新，方便调试时观察 */
+    g_gimbal.pitch_joint_deg = Gimbal_PitchJointDeg();
+
     /* 反馈超时：编码器/总线挂了，绝不能再按假数据算 */
     if ((HAL_GetTick() - g_gimbal.pitch_motor.last_rx_tick) > GIMBAL_FB_TIMEOUT_MS)
     {
@@ -206,7 +209,7 @@ void Gimbal_Control(void)
     }
 
     {
-        float fb = Gimbal_PitchJointDeg();
+        float fb = g_gimbal.pitch_joint_deg;
         float rpm_ref;
         float cur;
 
