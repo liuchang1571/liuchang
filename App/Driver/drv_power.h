@@ -93,6 +93,42 @@ typedef struct {
 /* 全局唯一的功率限制对象（★ 调试入口就在这里） */
 extern Power_t g_power;
 
+/* ============================================================================
+ *  ★★★ 底盘功率 / 缓冲能量 实时监测（不参与控制，给调试器看）★★★
+ * ============================================================================
+ *  在 CLion 调试器里把这几个加到 Watch：
+ *
+ *    g_chassis_buffer_j        缓冲能量 J  ★ 先看这个！
+ *                              你的功率计实测约 400 J（满值）
+ *                              如果显示 400 左右 -> 解析正确
+ *                              如果显示 -2456 之类的负数 -> 解析错了
+ *
+ *    g_chassis_buffer_max_j    开机以来见到的最大缓冲能量
+ *                              应该等于满值（约 400 J）
+ *
+ *    g_chassis_power_w         底盘功率 W（按单字节 1W 解析）
+ *                              不转：几瓦~几十
+ *                              空转：50~100
+ *                              下地：更高
+ *                              猛加速：瞬间一两百
+ *
+ *    g_power_level             当前限功率档位 0~3
+ *                              0=35W正常  1=25W  2=15W  3=0W停
+ *
+ *    g_power_limit_now_w       当前档位对应的限功率值 W
+ *
+ *    g_power_rx_cnt            收到 0x31 的累计帧数（不涨 = 没收到）
+ *    g_power_raw_p / raw_z     按大端拼的原始值（对比用）
+ * ==========================================================================*/
+extern volatile float    g_chassis_power_w;
+extern volatile float    g_chassis_buffer_j;
+extern volatile float    g_chassis_buffer_max_j;
+extern volatile int16_t  g_power_raw_p;
+extern volatile int16_t  g_power_raw_z;
+extern volatile uint32_t g_power_rx_cnt;
+extern volatile uint8_t  g_power_level;
+extern volatile float    g_power_limit_now_w;
+
 /**
   * @brief  初始化功率限制模块
   * @note   调用位置：App/Task/task_chassis.c 的 Task_Chassis_Init()。【开机一次】

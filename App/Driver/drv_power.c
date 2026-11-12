@@ -22,6 +22,20 @@
 Power_t g_power;
 
 /* ============================================================================
+ *  ★ 实时监测变量（只给调试器 / FreeMASTER 看，不参与控制）
+ * ============================================================================
+ *  在 CLion 调试器里把这几个加到 Watch 就能看到实时值。
+ * ==========================================================================*/
+volatile float    g_chassis_power_w   = 0.0f;  /* 底盘功率 W（按单字节 1W 解析） */
+volatile float    g_chassis_buffer_j  = 0.0f;  /* 缓冲能量 J（按小端 0.1J 解析）★ */
+volatile float    g_chassis_buffer_max_j = 0.0f; /* 开机以来见到的最大缓冲能量 J */
+volatile int16_t  g_power_raw_p       = 0;     /* 前两字节按【大端】拼的原始值 */
+volatile int16_t  g_power_raw_z       = 0;     /* 后两字节按【大端】拼的原始值 */
+volatile uint32_t g_power_rx_cnt      = 0U;    /* 收到 0x31 的累计帧数 */
+volatile uint8_t  g_power_level       = 0U;    /* 当前限功率档位 0~3 */
+volatile float    g_power_limit_now_w = 0.0f;  /* 当前档位对应的限功率值 W */
+
+/* ============================================================================
  *  Power_Init —— 初始化
  *  调用者：task_chassis.c 的 Task_Chassis_Init()，开机一次
  * ==========================================================================*/
@@ -32,6 +46,16 @@ void Power_Init(void)
     /* 默认"不缩放"，万一算错也不会把车锁死 */
     g_power.scale        = 1.0f;
     g_power.buffer_scale = 1.0f;
+
+    /* 监测变量清零 */
+    g_chassis_power_w        = 0.0f;
+    g_chassis_buffer_j       = 0.0f;
+    g_chassis_buffer_max_j   = 0.0f;
+    g_power_raw_p            = 0;
+    g_power_raw_z            = 0;
+    g_power_rx_cnt           = 0U;
+    g_power_level            = 0U;
+    g_power_limit_now_w      = POWER_LV0_W;
 }
 
 /* ============================================================================
@@ -43,9 +67,30 @@ void Power_Init(void)
  * ==========================================================================*/
 void Power_UpdateFeedback(int16_t power_0p1w, int16_t buffer_0p1j)
 {
-    /* 协议单位是 0.1W / 0.1J，乘 0.1 换成 W / J */
-    g_power.power_w      = (float)power_0p1w  * 0.1f;
-    g_power.buffer_j     = (float)buffer_0p1j * 0.1f;
+    uint16_t p_raw;
+    uint16_t z_raw;
+    int16_t  z_le;
+
+    /* 记下 bsp_can.c 按【大端】拼出来的原始值，供调试对比 */
+    p_raw = (uint16_t)power_0p1w;
+    z_raw = (uint16_t)buffer_0p1j;
+    g_power_raw_p  = (int16_t)p_raw;
+    g_power_raw_z  = (int16_t)z_raw;
+    g_power_rx_cnt = g_power_rx_cnt + 1U;
+
+    /* ---- 缓冲能量：实测是【小端】0.1J ----
+     * 你的功率计发 frame[2]=160, frame[3]=15：
+     *     大端读: (160<<8)|15 = 40975 -> int16 = -24561 -> x0.1 = -2456 J  ❌
+     *     小端读: (15<<8)|160 = 4000   ->          x0.1 =   400 J          ✅
+     * 所以这里把字节交换一下再算。 */
+    z_le = (int16_t)(((z_raw & 0x00FFU) << 8) | ((z_raw & 0xFF00U) >> 8));
+    g_power.buffer_j = (float)z_le * 0.1f;
+
+    /* ---- 底盘功率：实测是【单字节 frame[0]】，单位 1W ----
+     * frame[0] 就是大端值的高字节。
+     * 例：不转时几十、空转 50~100、下地更高 —— 符合物理。 */
+    g_power.power_w = (float)(p_raw >> 8);
+
     g_power.last_rx_tick = HAL_GetTick();
     g_power.online       = 1U;
 
@@ -53,6 +98,97 @@ void Power_UpdateFeedback(int16_t power_0p1w, int16_t buffer_0p1j)
     if (g_power.buffer_j > g_power.buffer_max_j)
     {
         g_power.buffer_max_j = g_power.buffer_j;
+    }
+
+    /* ---- 同步给调试器看的监测变量 ---- */
+    g_chassis_power_w      = g_power.power_w;
+    g_chassis_buffer_j     = g_power.buffer_j;
+    g_chassis_buffer_max_j = g_power.buffer_max_j;
+}
+
+/* ============================================================================
+ *  power_level_update —— 按缓冲能量决定限功率档位（带滞环）
+ *
+ *  思路：缓冲能量就是裁判系统的"余额"。
+ *        余额足 -> 正常给功率（跑得快）
+ *        余额少 -> 一档档收紧（牺牲速度换不断电）
+ *        余额见底 -> 直接停
+ *
+ *  ★ 为什么要滞环？
+ *    如果只用"低于 150 收紧、高于 150 放开"一个阈值，
+ *    缓冲就会在 150 附近来回跳，档位一秒钟切好几次。
+ *    所以"收紧"和"放开"用不同的阈值，中间留一段不动作的区间。
+ *
+ *  档位与阈值：
+ *      LV0  35W   余额 > 200J 才回到这档
+ *      LV1  25W   余额 < 150J 掉到这档，> 200J 回 LV0
+ *      LV2  15W   余额 < 100J 掉到这档，> 150J 回 LV1
+ *      LV3   0W   余额 <  40J 掉到这档，> 100J 回 LV2
+ * ==========================================================================*/
+static void power_level_update(void)
+{
+    float b;
+
+    /* 数据不可信（没在线 / 超出合理范围）-> 退回最高档，纯开环。
+     * ★ 不能让坏数据把车锁死在 0W。 */
+    if ((g_power.online == 0U) ||
+        (g_power.buffer_j < POWER_SANE_J_MIN) ||
+        (g_power.buffer_j > POWER_SANE_J_MAX))
+    {
+        g_power_level       = 0U;
+        g_power_limit_now_w = POWER_LV0_W;
+        return;
+    }
+
+    b = g_power.buffer_j;
+
+    /* ---- 档位迁移（含滞环）---- */
+    switch (g_power_level)
+    {
+    case 0U:
+        if (b < POWER_TRIP_LV1)
+        {
+            g_power_level = 1U;         /* 余额偏低 -> 收紧 */
+        }
+        break;
+
+    case 1U:
+        if (b > POWER_TRIP_LV0)
+        {
+            g_power_level = 0U;         /* 充回来了 -> 放开 */
+        }
+        else if (b < POWER_TRIP_LV2)
+        {
+            g_power_level = 2U;         /* 继续掉 -> 再收紧 */
+        }
+        break;
+
+    case 2U:
+        if (b > POWER_TRIP_LV1)
+        {
+            g_power_level = 1U;
+        }
+        else if (b < POWER_TRIP_LV3)
+        {
+            g_power_level = 3U;         /* 快见底 -> 停 */
+        }
+        break;
+
+    default:
+        if (b > POWER_TRIP_LV2)
+        {
+            g_power_level = 2U;         /* 回充够了 -> 恢复 */
+        }
+        break;
+    }
+
+    /* ---- 档位 -> 本拍的限功率值 ---- */
+    switch (g_power_level)
+    {
+    case 0U:  g_power_limit_now_w = POWER_LV0_W; break;
+    case 1U:  g_power_limit_now_w = POWER_LV1_W; break;
+    case 2U:  g_power_limit_now_w = POWER_LV2_W; break;
+    default:  g_power_limit_now_w = POWER_LV3_W; break;
     }
 }
 
@@ -76,6 +212,7 @@ float Power_CalcScale(const int16_t i_raw[], const int16_t rpm[], uint8_t cnt)
     float c;            /* C = P - L */
     float k;            /* 结果 */
     float p_full;       /* F(1)：不缩放时的预测功率 */
+    float p_lim;        /* 本拍实际使用的限功率值（按缓冲能量分档） */
     float disc;         /* 求根公式里的判别式 */
     uint8_t t;
 
@@ -103,6 +240,12 @@ float Power_CalcScale(const int16_t i_raw[], const int16_t rpm[], uint8_t cnt)
         g_power.online = 0U;
     }
 
+    /* ---- 第 0.5 步：按缓冲能量决定本拍的限功率档位 ----
+     * 缓冲余额足 -> 35W；余额少 -> 逐档收紧到 25 / 15 / 0W。
+     * 详见 power_level_update() 的注释。 */
+    power_level_update();
+    p_lim = g_power_limit_now_w;
+
     /* ---- 第 1 步：累加 ---- */
     sum_i2 = 0.0f;
     sum_in = 0.0f;
@@ -120,7 +263,7 @@ float Power_CalcScale(const int16_t i_raw[], const int16_t rpm[], uint8_t cnt)
     /* ---- 第 2 步：算出 A、B 和 F(1) ---- */
     a = POWER_R_OHM  * sum_i2;
     b = POWER_K_COEF * sum_in;
-    c = POWER_LIMIT_W - POWER_BASE_W;
+    c = p_lim - POWER_BASE_W;
 
     g_power.a_coef   = a;
     g_power.b_coef   = b;
@@ -128,7 +271,7 @@ float Power_CalcScale(const int16_t i_raw[], const int16_t rpm[], uint8_t cnt)
     g_power.p_pred_w = p_full;
 
     /* ---- 第 3 步：不超限就不缩 ---- */
-    if (p_full <= POWER_LIMIT_W)
+    if (p_full <= p_lim)
     {
         k = 1.0f;
     }
